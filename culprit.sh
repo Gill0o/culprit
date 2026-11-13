@@ -1,7 +1,7 @@
-#!/bin/zsh
+#!/bin/zsh -f
 # ============================================================================
 # Script: culprit.sh
-# Version: 1.0.2
+# Version: 1.0.3
 # Author: Gilles Bonpain
 # Powered by Claude AI
 # Description: Attribute what macOS apps and tools run, delete and read
@@ -47,7 +47,7 @@
 #       pair with no `=`, refuses the policy.
 #   $11 Log path (blank = /var/log/culprit-v<version>.log; named: no fallback)
 #
-# Requirements: root + Full Disk Access on the terminal, macOS 13+, python3.
+# Requirements: root + Full Disk Access on the terminal, macOS 15+, python3.
 # ============================================================================
 
 set -e
@@ -126,10 +126,28 @@ typeset -ga DEFAULT_EXCLUDES=(
 # a `# culprit: …` line or repaint the screen.
 _inert() {
   local s="$1" o="" c i
-  if [[ "$s" != *[[:cntrl:]]* ]]; then print -rn -- "$s"; return 0; fi
+  # A byte that is not UTF-8 too: raw, 0x9b is the terminal's CSI.
+  if [[ "$s" != *[[:cntrl:][:INVALID:]]* ]]; then print -rn -- "$s"; return 0; fi
   for (( i = 1; i <= ${#s}; i++ )); do
     c="${s[i]}"
-    if [[ "$c" == [[:cntrl:]] ]]; then o+="$(printf '\\x%02x' "'$c")"; else o+="$c"; fi
+    if [[ "$c" == [[:cntrl:][:INVALID:]] ]]; then o+="$(printf '\\x%02x' "'$c")"; else o+="$c"; fi
+  done
+  print -rn -- "$o"
+}
+# The parser's inert_word, for a name an observed bundle chose (a label, a
+# Spotlight match) printed in a `#` line: pasted where `#` is not a comment, it
+# must hold no shell syntax. Kept: ASCII letters and digits, ` ._-/+:,@%=~`, and
+# any non-ASCII character that is neither punctuation nor space; a control
+# character (bidi and zero-width ones included) becomes \xNN, anything else `_`.
+_inert_word() {
+  local s="$1" o="" c i
+  if [[ "$s" != *[^A-Za-z0-9\ ._/+:,@%=~-]* ]]; then print -rn -- "$s"; return 0; fi
+  for (( i = 1; i <= ${#s}; i++ )); do
+    c="${s[i]}"
+    if [[ "$c" == [A-Za-z0-9\ ._/+:,@%=~-] ]]; then o+="$c"
+    elif [[ "$c" == [[:cntrl:][:INVALID:]] ]]; then o+="$(printf '\\x%02x' "'$c")"
+    elif [[ "$c" == [[:graph:]] && "$c" != [[:punct:]] ]]; then o+="$c"
+    else o+="_"; fi
   done
   print -rn -- "$o"
 }
@@ -138,164 +156,57 @@ show_help() {
   /bin/cat << 'EOF'
 Usage: sudo ./culprit.sh [app] [OPTIONS]
 
-Attributes each command an app shells out, and its API-level file operations, to
-that app as a replayable command line. Observation only: nothing is run or
-blocked.
+Attributes each command an app runs, and the files it deletes, moves, copies or
+reads, to that app as a replayable command line. Observes only: nothing is run
+or blocked.
 
 Arguments:
-  [app]                 Restrict to one app, by bundle path
-                        (/Applications/Whatever.app), bundle ID (com.vendor.app,
-                        Spotlight-resolved and path-independent, the form to use
-                        on a fleet), or a registry label. A path or ID works for
-                        any app, listed or not; its Team ID is read so its
-                        privileged helper is attributed with it. A CLI tool is
-                        targetable the same way, by name (`brew`, resolved on the
-                        PATH and in the Homebrew, MacPorts and /usr/local
-                        prefixes) or by path (/opt/homebrew/bin/…,
-                        /Library/PrivilegedHelperTools/…): software shipping no
-                        bundle is treated as an actor, its own command line
-                        included with its arguments. Omitted, the scope is every
-                        third-party app and tool; --apps <labels> for a set.
+  [app]                 One app or tool: bundle path (/Applications/X.app),
+                        bundle ID (com.vendor.app, best on a fleet), registry
+                        label, CLI name (brew) or path. Its privileged helper
+                        is attributed with it (same Team ID). Omitted: every
+                        third-party app and tool.
 
-Options:
-  Marked (CLI only) below have no Jamf Pro parameter — see the header comment
-  for the eight Jamf gets ($4-$11); everything else keeps its default there.
-  -l, --log <path>      Log file path (default /var/log/culprit-v<version>.log).
-                        A named path is the only one used: if it cannot be
-                        written safely the run stops, nothing falls back.
-                        One capture per file: a watcher left running keeps
-                        writing to the same report accumulator, so a second run
-                        on that log is refused and names the pid to stop.
-  -v, --verbose         (CLI only) Timestamped and unfiltered: the noise filter, the
-                        toolchain rule and the exclude list are all disabled, and
-                        Apple's applications become actors (Terminal, Script
-                        Editor) while its daemons remain out. Not paste-ready.
-  -q, --only-cmds       Emitted commands alone (default)
-  --debug               (CLI only) Dump the JSON shape of the first events of each kind, to
-                        confirm the eslogger schema of a given macOS release.
-                        Adds '# FILTERED: <cmd> (reason)' for every command the
-                        noise filter drops, and — in ALL mode — '# UNATTRIBUTED:
-                        <cmd>' for every third-party exec resolving to no actor,
-                        so an attribution gap is stated rather than silent.
-                        Produces nothing under --report, which suppresses it —
-                        except with --ndjson, whose stream stays live.
-  --apps <labels>       Comma-separated labels to watch (overrides [app]). Also
-                        settable via Jamf's `$10` (`apps=` key).
-  --all                 Every third-party app and tool; the default. Apple's own
-                        commands are dropped. Registry labels still apply;
-                        anything else is named after its .app bundle.
-  --events <list>       Which optional event families to subscribe: files, reads,
-                        opens, tcc, btm (exec is always on). A bare list (files,opens)
-                        sets exactly those — except reads/opens alone, which imply
-                        files too: neither means anything without the file-operation
-                        subscription they ride on. +term/-term (+opens, -reads,-opens)
-                        adjust the default (files+reads+tcc+btm on, opens off)
-                        instead of replacing it. An unknown term refuses the whole
-                        list. --no-files, --no-reads and --opens below are
-                        shorthands for the single-term case, through the same
-                        code path, so every spelling and order agrees. Also
-                        settable via Jamf's `$10` (`events=` key).
-                        tcc: privacy (TCC) grants and revokes — Full Disk
-                        Access, Camera, Automation, etc. — reported even though
-                        no file changes and no command runs. On by default
-                        (volume is tiny); `--events -tcc` drops it. Needs
-                        macOS 26+ (ES_EVENT_TYPE_NOTIFY_TCC_MODIFY); older
-                        releases drop it via the same preflight as any other
-                        unsupported event type — no special case, no error.
-                        btm: login items added or removed — a toggle in System
-                        Settings > Login Items, or software registering itself
-                        via SMAppService/ServiceManagement — reported even
-                        though no command runs. On by default (volume is
-                        tiny); `--events -btm` drops it.
-  --no-reads            Omit the directories an app scans; deletions, moves and
-                        copies remain. A SUBSCRIPTION cut — readdir stops firing,
-                        so a scan never becomes an event — unlike --no-queries
-                        below, which trims already-captured lines by what their
-                        command does, not by event type.
-  --no-files            Commands only — no file events. Both are reported by
-                        default: an app operating through the system APIs runs no
-                        command at all and would otherwise register as idle.
-  --opens               Report which files an app reads (open events), emitted
-                        as `cat <path>`. A directory scan gives the location an
-                        app looked in; this gives the file it opened there, and
-                        so its type. Opt-in and high volume, firing on every file
-                        access: intended for a single target. Permitted in ALL
-                        mode, with a warning.
-  --mdm                 Render the emitted commands fleet-deployable: host user
-                        paths become /Users/$loggedInUser/…, and the per-user
-                        DARWIN folders (/var/folders/…/{0,C,T}, a per-machine
-                        token) become $userDir/$userCache/$userTemp, resolved by
-                        `getconf` as an app resolves them. A resolver header
-                        defines each. The output runs on any Mac in the fleet.
-  --report              Capture silently, then on stop emit one structured
-                        report: the distinct commands, the destructive, network,
-                        persistence, secret and privacy (TCC) sections, and a
-                        paste-ready script in order.
-                        Pairs with --detach. Reboot-safe: each command is fsync'd
-                        to <log>.report as captured, so a Mac rebooted mid-run
-                        loses nothing and the next --report launch renders it.
-  --report-file <path>  (CLI only) Write the --report output to <path> on stop
-                        instead of stdout — the same bytes --report prints. Must
-                        not exist yet or be empty. Needs --report.
-  --no-fold             Emit deletions individually. By default a syscall
-                        tree-wipe is summarised as one `rm -rf <dir>/*`, and the
-                        directory is examined afterwards to establish whether
-                        that summary is exact or remains ⚠ approximate; --no-fold
-                        emits every `unlink` as its own `rm -rf <file>`.
-  --stable              Report as one normalised command per line, sorted and
-                        de-duplicated, with no counts, no headers, no `sleep` and
-                        no trailing caveats. Two captures of software that behaved
-                        the same then produce identical files, so a `diff` between
-                        them shows acts and not artefacts. Every line that does not
-                        open with `#` is a command. Pair with --mdm to compare
-                        across Macs. Needs --report; it shapes the report.
-  --marks-only          Report only the lines carrying a mark — destructive,
-                        network, persistence, secret. Unlike --destructive-only it
-                        keeps a ⚠ secret line, which destroys nothing, and it
-                        un-subscribes nothing: the capture is whole, the report is
-                        narrower. Needs --report.
-  --no-queries          Drop the lines that only read — `defaults read`,
-                        `diskutil info`, `system_profiler`, `fdesetup status` and
-                        the filters they pipe through. An app's launch checks are
-                        worth reading in an audit and useless in a replay script.
-                        A line that writes anywhere — a redirection to a file,
-                        `defaults export`, `plutil -o <file>` — or carries a mark
-                        is kept. Live output and report alike.
-  --ndjson              (CLI only) The live stream as one JSON object per line
-                        (ts/cmd/via/marks/kind/app/pid/pidver for a command,
-                        type:"info" for everything else)
-                        instead of text, for a SIEM or inventory to ingest. Same
-                        objects go to the log file and the unified-log copy. With
-                        --report the stream stays live and the text report is
-                        written on stop to --report-file, by default
-                        <log>.report.txt — never onto the stream.
-  --cmd <list>          Restrict output to these commands, by name (ls,rm,
-                        defaults), bypassing the noise filter for them. Also
-                        settable via Jamf's `$10` (`cmd=` key).
-  --destructive-only    Destructive commands alone (rm -rf, kill, erase, cache
-                        flushes, launchctl bootout, …), in any mode. Directory
-                        scans, file reads and TCC changes are un-subscribed with
-                        them: none of them modifies anything, so none can
-                        qualify. This also spares the event stream.
-  --exclude <list>      Comma-separated substrings/Team IDs to drop in --all
-                        mode, appended to the built-in updater excludes.
-  --detach              Background the capture and return the prompt. Intended
-                        for apps that quit every open application before working
-                        (OnyX): the capture outlives its terminal, and SIGHUP is
-                        ignored rather than trapped, so it keeps recording while
-                        the app works. Reports how to follow the log and stop it.
-  --duration <secs>     Stop by itself after that many seconds, render the report
-                        and exit 0 — a planned stop is a success. An unattended run
-                        needs this: the report is only written when a capture ends.
-                        It is an UPPER BOUND, not a promise — a capture also ends
-                        when eslogger's client is dropped, and a security agent may
-                        take the slot. When that happens the log says so, with how
-                        long the capture actually got, so a truncated report is
-                        never mistaken for a complete one.
-  -h, --help            Show this help
+Options — (CLI only): no Jamf Pro parameter. Jamf gets $4-$11 (see the header);
+$10 takes key=value pairs: apps=, events=, cmd=, exclude=.
+  -l, --log <path>      Log file (default /var/log/culprit-v<version>.log).
+                        Refused if unsafe, no fallback; one capture per log.
+  -v, --verbose         (CLI only) Timestamped and unfiltered; Apple's apps
+                        become actors. Not paste-ready.
+  -q, --only-cmds       Commands alone (default).
+  --debug               (CLI only) Dump the first events' JSON shape; show what
+                        the noise filter drops and what no actor claims.
+  --apps <labels>       Comma-separated labels to watch (overrides [app]).
+  --all                 Every third-party app and tool (default).
+  --events <list>       Optional event families: files, reads, opens, tcc, btm.
+                        Default: all but opens. A list replaces it, +x/-x
+                        adjusts it (--events +opens,-tcc). tcc: macOS 15.4+.
+  --no-reads            No directory scans (an event cut; --no-queries instead
+                        trims read-only commands from the output).
+  --no-files            Commands only, no file events.
+  --opens               Also report files read, as `cat <path>`. High volume.
+  --mdm                 Fleet-ready output: /Users/$loggedInUser/…, and
+                        $userDir/$userCache/$userTemp for /var/folders.
+  --report              Capture silently; on stop, print the marked sections
+                        and a paste-ready script. Survives a reboot.
+  --report-file <path>  (CLI only) Write the report there instead of stdout.
+  --no-fold             One `rm` per deleted file instead of `rm -rf <dir>/*`.
+  --stable              Sorted, de-duplicated report, to diff two captures.
+  --marks-only          Only the lines carrying a ⚠ mark, in the report.
+  --no-queries          Drop read-only commands (defaults read, diskutil info…).
+  --ndjson              (CLI only) One JSON object per line, for a SIEM
+                        (ts/cmd/via/marks/kind/app/pid/pidver).
+  --cmd <list>          Only these commands (ls,rm,defaults), unfiltered.
+  --destructive-only    Destructive commands alone, any actor.
+  --exclude <list>      Substrings or Team IDs to drop in --all mode.
+  --detach              Run in the background, past the terminal closing (OnyX
+                        quits it).
+  --duration <secs>     Stop after that long, report, exit 0. Needed unattended.
+  -h, --help            This help.
+  --report-file, --stable and --marks-only need --report.
 
-Requirements: root, Full Disk Access on the invoking terminal, macOS 13+ for
-eslogger, python3.
+Requirements: root, Full Disk Access on the invoking terminal, macOS 15+ (13-14
+start with a warning: untested), python3.
 
 Exit codes: 0 done · 1 refused before starting · 130 Ctrl+C · 143 SIGTERM ·
 129 SIGHUP. A capture stopped by a signal still writes its report.
@@ -305,7 +216,7 @@ Examples:
   sudo ./culprit.sh /Applications/X.app   # one app by bundle path
   sudo ./culprit.sh com.vendor.app        # one app by bundle ID
   sudo ./culprit.sh brew                  # a CLI tool by name — brew, not bash
-  sudo ./culprit.sh /Library/PrivilegedHelperTools/com.vendor.helper  # or by path
+  sudo ./culprit.sh /Library/PrivilegedHelperTools/com.vendor.helper  # by path
   sudo ./culprit.sh --apps OnyX,Maintenance   # a specific set
   sudo ./culprit.sh --destructive-only    # dangerous commands, any actor
   sudo ./culprit.sh --detach OnyX         # outlives OnyX quitting the terminal
@@ -732,7 +643,9 @@ export CULPRIT_REALNAME="${_UREAL#RealName: }"
 # Python3 detection (the parser needs it). Check xcode-select first to avoid the
 # /usr/bin/python3 CLT-install popup.
 PYTHON3_BIN=""
-_python3_validate() { "$1" -c 'import json,sys' >/dev/null 2>&1 && PYTHON3_BIN="$1" && return 0; return 1; }
+# Every python3 run here takes -I: no cwd or script directory on sys.path, no
+# PYTHON* variable, no user site — root imports nothing the caller planted.
+_python3_validate() { "$1" -I -c 'import json,sys' >/dev/null 2>&1 && PYTHON3_BIN="$1" && return 0; return 1; }
 _clt=false; /usr/bin/xcode-select -p >/dev/null 2>&1 && _clt=true
 if [ "$_clt" = true ] && [ -x /usr/bin/python3 ] && _python3_validate /usr/bin/python3; then :
 elif command -v python3 >/dev/null 2>&1; then
@@ -970,6 +883,17 @@ _find_cli() {
   done
   return 1
 }
+# The Team ID codesign reports for <path>, or nothing. Only a line that IS
+# `TeamIdentifier=<value>`, and only one (a newline in the executable's name prints
+# a second); the value is ten characters [A-Z0-9], so "not set" and anything that
+# could carry a registry separator are no Team ID.
+_team_id_of() {
+  local t
+  t=$(/usr/bin/codesign -dv --verbose=2 "$1" 2>&1 \
+      | /usr/bin/awk -F= '$1=="TeamIdentifier"{n++; t=(NF==2?$2:"")} END{if(n==1)print t}') || t=""
+  [[ "$t" =~ '^[A-Z0-9]{10}$' ]] && print -r -- "$t"
+  return 0
+}
 # Target an app by path. A registry entry for that bundle takes precedence;
 # otherwise an entry is built on the spot, codesign supplying the Team ID so the
 # privileged helper is attributed too. A plain executable (Homebrew/MacPorts tool,
@@ -991,8 +915,7 @@ _target_from_path() {
       if [[ -n "$b" && "$b" == "$path" ]]; then TARGET_APPS=("$line"); return 0; fi
     done
     label="${path:t:r}"
-    team=$(/usr/bin/codesign -dv --verbose=2 "$path" 2>&1 | /usr/bin/awk -F= '/^TeamIdentifier/{print $2}') || team=""
-    [[ "$team" == "not set" ]] && team=""
+    team=$(_team_id_of "$path")
     TARGET_APPS=("${label}|${team}|${path}||")
     return 0
   fi
@@ -1017,8 +940,7 @@ _target_from_path() {
     printf '# culprit: not an executable, and not an .app bundle: %s\n' "$(_inert "$path")" >&2; exit 1
   fi
   label="${path:t}"
-  team=$(/usr/bin/codesign -dv --verbose=2 "$real" 2>&1 | /usr/bin/awk -F= '/^TeamIdentifier/{print $2}') || team=""
-  [[ "$team" == "not set" ]] && team=""
+  team=$(_team_id_of "$real")
   cli="$real"
   [[ "$real" != "$path" ]] && cli="${real},${path}"
   # 5th field = CLI paths: matched exactly; its own exec is shown as a command.
@@ -1075,7 +997,7 @@ _target_from_bundle_id() {
   fi
   if (( ${#matches} > 1 )); then
     printf '# culprit: bundle id %s is ambiguous — pass one path:\n' "$(_inert "$bid")" >&2
-    local _m; for _m in "${matches[@]}"; do printf '#   %s\n' "$(_inert "$_m")" >&2; done
+    local _m; for _m in "${matches[@]}"; do printf '#   %s\n' "$(_inert_word "$_m")" >&2; done
     exit 1
   fi
   _target_from_path "${matches[1]}"
@@ -1110,6 +1032,18 @@ if [ "$ALL_MODE" != "true" ]; then
     unset _cli_hit
   fi
 fi
+
+# Root never works from the caller's directory. Every path the command line named
+# is absolute from here on (app, --report-file above; the log now), and the script
+# itself is named by its absolute path. `$0` read outside the function: inside one
+# it is the function's name.
+_CULPRIT_SELF="${0:A}"
+_leave_cwd() {
+  _CULPRIT_CWD="$PWD"
+  LOGFILE="${LOGFILE:a}"
+  builtin cd / || exit 1
+}
+_leave_cwd
 
 # ---------------------------------------
 # Exact bundle identifiers, for tcc_modify rule (a)
@@ -1147,17 +1081,17 @@ unset _bundle_ids _bt _blbl _bpath _bid
 [ "$WATCH_OPENS" = "true" ] && EVENT_TYPES+=(open)
 # tcc_modify: a privacy grant or revoke (Settings UI, `tccutil`, MDM profile)
 # touches no file and runs no command; tccd's event is the only record. Low
-# volume, on by default. macOS 26+ only: the preflight below drops it elsewhere.
+# volume, on by default. macOS 15.4+ only: the preflight below drops it elsewhere.
 [ "$WATCH_TCC" = "true" ] && EVENT_TYPES+=(tcc_modify)
 # btm_launch_item_add/remove: a login item added or removed (System Settings,
 # `SMAppService`, MDM agent) touches no file and runs no command we catch;
 # backgroundtaskmanagementd's event is the only record. Low volume, on by default;
-# present since macOS 13.
+# present since macOS 13 (supported floor: 15).
 [ "$WATCH_BTM" = "true" ] && EVENT_TYPES+=(btm_launch_item_add btm_launch_item_remove)
 # exit separates a wait from a command still running, so `sleep` lines do not
-# charge a slow command's run time to the pause after it. Never printed; only
-# --report emits sleeps, so only --report subscribes.
-[ "$REPORT" = "true" ] && EVENT_TYPES+=(exit)
+# charge a slow command's run time to the pause after it, and frees the pid in
+# the attribution table (macOS reuses pids). Never printed; always subscribed.
+EVENT_TYPES+=(exit)
 # Preflight against what this macOS supports: eslogger refuses the whole
 # subscription if one name is unknown. `--list-events` needs no root and creates
 # no ES client. A dropped type is announced; a missing `exec` is fatal.
@@ -1223,13 +1157,15 @@ _json_escape() {
   s="${s//$'\t'/\\t}"
   # Any other control byte is invalid raw in JSON; escape per character, only
   # when one is present.
-  if [[ "$s" == *[[:cntrl:]]* ]]; then
+  if [[ "$s" == *[[:cntrl:][:INVALID:]]* ]]; then
     # zsh counts some characters above U+FFFF as control: `\u%04x` of those has
-    # five digits. Only C0/C1/DEL need the escape.
+    # five digits. Only C0/C1/DEL need the escape. A byte that is not UTF-8 is
+    # U+FFFD, as nd_dumps writes it: the line stays valid UTF-8.
     local out="" c i u
     for (( i = 1; i <= ${#s}; i++ )); do
       c="${s[i]}"
-      if [[ "$c" == [[:cntrl:]] ]]; then
+      if [[ "$c" == [[:INVALID:]] ]]; then out+="\\ufffd"
+      elif [[ "$c" == [[:cntrl:]] ]]; then
         u="$(printf '%04x' "'$c")"
         if (( ${#u} > 4 )); then out+="$c"; else out+="\\u$u"; fi
       else out+="$c"; fi
@@ -1411,7 +1347,11 @@ log_line() {
 PARSER="$CULPRIT_TMPDIR/parser.py"
 /bin/cat > "$PARSER" <<'PY'
 import sys, json, time, shlex, re, os, math, signal, stat, functools, tempfile
-import urllib.parse
+import urllib.parse, unicodedata
+
+# The stream is UTF-8 whatever the locale (python runs with -I, so no PYTHONIOENCODING): a non-UTF-8 byte reads
+# as U+DC80-U+DCFF and never raises.
+for _stream in (sys.stdin, sys.stdout): _stream.reconfigure(encoding="utf-8", errors="surrogateescape")
 
 # One file, read top to bottom in processing order; each section below is framed.
 
@@ -1911,7 +1851,7 @@ def _tcc_identity_is_apple(identity, itype):
 def _app_suffix(label):
     # Which watched app a TCC/BTM line belongs to. SOLO names one app, so nothing is added; with several
     # targets or in ALL mode the label is appended. Empty when no label applies (rule (c)).
-    return " — app: %s" % label if label and not SOLO else ""
+    return " — app: %s" % inert_word(label) if label and not SOLO else ""
 
 def _tcc_actor(tm):
     resp = tm.get("responsible")
@@ -1976,7 +1916,8 @@ def handle_tcc_modify(tm, proc):
             raw_out("C\t" + nd_dumps(obj))
         else:
             raw_out("C\t# TCC: %s %s for %s (%s, %s)%s"
-                    % (service, right_s, mdm_rewrite(identity), reason_s, utype_s, _app_suffix(label)))
+                    % (inert_word(service), inert_word(right_s), inert_word(mdm_rewrite(identity)),
+                       inert_word(reason_s), inert_word(utype_s), _app_suffix(label)))
     record_tcc(service, identity, right_s, reason_s, utype_s, actor_path, label or "")
 
 # ============================================================================
@@ -2089,10 +2030,11 @@ def handle_btm_launch_item(bt, action, proc):
         else:
             _suffix = kind_s + (" (managed)" if managed else "") + (" (legacy)" if legacy else "")
             _app = _app_suffix(label)
+            _bp, _bs = inert_word(mdm_rewrite(path)), inert_word(short)
             if action == "add":
-                raw_out("C\t# LOGIN ITEM added (%s): %s — via %s%s   ⚠ persistence" % (_suffix, mdm_rewrite(path), short, _app))
+                raw_out("C\t# LOGIN ITEM added (%s): %s — via %s%s   ⚠ persistence" % (_suffix, _bp, _bs, _app))
             else:
-                raw_out("C\t# LOGIN ITEM removed (%s): %s — via %s%s" % (_suffix, mdm_rewrite(path), short, _app))
+                raw_out("C\t# LOGIN ITEM removed (%s): %s — via %s%s" % (_suffix, _bp, _bs, _app))
     record_btm(action, path, kind_s, short, label or "")
 
 # ============================================================================
@@ -2847,7 +2789,30 @@ def noise_reason(path, args, label=""):
 # capture runs for hours.
 
 tracked = {}          # pid -> label
+tracked_ver = {}      # pid -> pidversion of the image that last named it (absent when the event carried none)
 TRACK_CAP = 20000
+
+def track(pid, label, ver=None):
+    # Insertion order is age: pop first so a refreshed pid moves to the end. A full table drops the OLDEST tenth,
+    # never everything at once (a flood of unrelated execs must not blind the app being watched).
+    tracked.pop(pid, None)
+    tracked[pid] = label
+    if ver is None: tracked_ver.pop(pid, None)
+    else: tracked_ver[pid] = ver
+    if len(tracked) > TRACK_CAP:
+        for _k in list(tracked)[:max(1, TRACK_CAP // 10)]:
+            del tracked[_k]
+            tracked_ver.pop(_k, None)
+
+def untrack(pid, ver=None):
+    # The process EXITED: its pid is free for macOS to hand to an unrelated one. pidversion only grows, and an
+    # exec bumps it, so the exit of the last image carries a version >= the one recorded; a LOWER version is a
+    # stale exit of an earlier generation and leaves the entry alone. No version on either side: by pid.
+    if pid not in tracked: return
+    rv = tracked_ver.get(pid)
+    if ver is not None and rv is not None and ver < rv: return
+    del tracked[pid]
+    tracked_ver.pop(pid, None)
 last_seen = {}
 DEDUP_S = 1.0
 
@@ -2905,7 +2870,7 @@ def degrade(reason):
     if _degraded[reason] == 1:
         # "C\t": the watcher keeps only C/D/R lines.
         out("C\t# NOTE: an event was observed but could not be fully read (%s). "
-            "The capture is incomplete; run with --debug to see the shape." % reason)
+            "The capture is incomplete — run with --debug to see the shape." % inert_word(reason))
 
 # Set when an accumulator exists but is not trusted, so the refusal is reported.
 _rep_refused = False
@@ -2956,7 +2921,68 @@ def raw_out(s):
 
 def _inert(s):
     s = _NL_RE.sub(lambda m: "\\n" if m.group(0) == "\n" else "\\r", s)
-    return _CTL_RE.sub(lambda m: "\\x%02x" % ord(m.group(0)), s)
+    s = _CTL_RE.sub(lambda m: "\\x%02x" % ord(m.group(0)), s)
+    # A lone surrogate never reaches the stream: surrogateescape would write U+DC9B as the raw C1 byte 0x9b
+    # (CSI). The byte it stands for as \xNN, any other one as U+FFFD.
+    return _SURR_RE.sub(_surr_esc, s) if _SURR_RE.search(s) else s
+
+_SURR_RE = re.compile(r'[\ud800-\udfff]')
+def _surr_esc(m):
+    o = ord(m.group(0))
+    return "\\x%02x" % (o - 0xdc00) if 0xdc80 <= o <= 0xdcff else "\ufffd"
+
+# Text an observed process chose (an app, helper or bundle name, a path, a TCC service) shown in a `#` line.
+# Pasted into a zsh where INTERACTIVE_COMMENTS is off (the macOS default), `#` is a command and the rest of
+# the line is parsed: so the text keeps no shell syntax. Kept: letters, digits and marks of any script, and
+# ` ._-/+:,@%=~`, plus --mdm's own variables; a control character becomes \xNN (as in _inert), a non-UTF-8
+# byte its \xNN, and anything else — `;&|$`()<>'"\*?[]{}!#`, tab, bidi and zero-width characters — `_`.
+_WORD_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._-/+:,@%=~")
+def _word_piece(s):
+    if all(c in _WORD_OK for c in s): return s
+    out = []
+    for c in s:
+        o = ord(c)
+        if c in _WORD_OK: out.append(c)
+        elif c == "\n": out.append("\\n")
+        elif c == "\r": out.append("\\r")
+        elif o < 0x20 or 0x7f <= o <= 0x9f: out.append("\\x%02x" % o)
+        elif 0xdc80 <= o <= 0xdcff: out.append("\\x%02x" % (o - 0xdc00))
+        elif o > 0x9f and not 0xd800 <= o <= 0xdfff and unicodedata.category(c)[0] in "LNM": out.append(c)
+        else: out.append("_")
+    return "".join(out)
+def inert_word(s):
+    if not s: return ""
+    if not isinstance(s, str): s = str(s)
+    if s == "?": return s                      # the parser's own "unknown"
+    if "$" not in s: return _word_piece(s)
+    _parts, _at = [], 0
+    for m in _MDM_VAR_RE.finditer(s):
+        _parts.append(_word_piece(s[_at:m.start()])); _parts.append(m.group(0)); _at = m.end()
+    _parts.append(_word_piece(s[_at:]))
+    return "".join(_parts)
+
+# A command quoted inside a `#` line (the report's ⚠ summaries, FILTERED). Kept as it is when nothing in it
+# can act once pasted: outside single quotes and `$'…'`, and inside double quotes (where --mdm's variables
+# alone may expand), no `;&|$`()<>!\` and no unbalanced quote. Otherwise (an unwrapped payload: `;`, `$(…)`,
+# a pipe) the whole of it is rendered by inert_word. Globs and braces only expand.
+_CMD_ACTS_RE = re.compile(r"[;&|$`()<>!\"'\\\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
+_DQ_ACTS_RE = re.compile(r"[$`!\\\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
+# One shell word-piece per match, in the shell's order; a bare run is taken whole (a report holds thousands).
+_CMD_WALK_RE = re.compile(r"""'[^']*'|"(?:[^"\\]|\\.)*"|\$'(?:[^'\\]|\\.)*'|\\.|[^'"\\$]+|.""", re.S)
+def comment_cmd(c):
+    if not c: return ""
+    if c.isascii():
+        if not _CMD_ACTS_RE.search(c): return c
+    elif any(unicodedata.category(ch) == "Cf" for ch in c): return inert_word(c)
+    _bare = []
+    for m in _CMD_WALK_RE.finditer(_MDM_VAR_RE.sub("", c)):
+        t = m.group(0)
+        if t[:1] == "'" and len(t) > 1 or t[:2] == "$'" and len(t) > 2: continue
+        if t[:1] == '"' and len(t) > 1:
+            if _DQ_ACTS_RE.search(t[1:-1]): return inert_word(c)
+            continue
+        _bare.append(t)
+    return inert_word(c) if _CMD_ACTS_RE.search("".join(_bare)) else c
 
 def out(s):
     if QUIET: return
@@ -3603,13 +3629,14 @@ def _persist_rollup_lines(entries, btm):
     _lines = ["# What survives a reboot (%d):" % _n_persist]
     for _pp in sorted(_persist_items):
         _pk, _pa = _persist_items[_pp]
-        _lines.append("#   %s: %s — via %s" % (_pk, _pp, _pa))
+        _lines.append("#   %s: %s — via %s" % (_pk, inert_word(_pp), inert_word(_pa)))
     for _pp, _bv in _btm_items:
         # (kind, short[, label]); the label is optional.
         _kind_s, _short = _bv[0], _bv[1]
         _blbl = _bv[2] if len(_bv) > 2 else ""
         _lines.append("#   Login item (%s): %s — via %s%s"
-                       % (_kind_s, mdm_rewrite(_pp), _short or "?", _app_suffix(_blbl)))
+                       % (inert_word(_kind_s), inert_word(mdm_rewrite(_pp)), inert_word(_short) or "?",
+                          _app_suffix(_blbl)))
     return _lines
 
 def _tcc_lines_for(tcc):
@@ -3623,7 +3650,10 @@ def _tcc_lines_for(tcc):
         _tlbl = _tv[5] if len(_tv) > 5 else ""
         # A path identity (identity_type 1) can sit in a home: --mdm rewrites it at render time; the
         # accumulator keeps the raw one.
-        _id = mdm_rewrite(_id)
+        _id = inert_word(mdm_rewrite(_id))
+        # Read back from the accumulator: every field is rendered, the enums included.
+        _svc, _right, _reason, _utype = inert_word(_svc), inert_word(_right), inert_word(_reason), inert_word(_utype)
+        _short = inert_word(_short)
         if STABLE:
             # reason and update_type say how a grant arrived, not what the current state is.
             _lines.append("#   %s: %s -> %s%s"
@@ -3676,7 +3706,7 @@ def _render_lines(entries, recovered, ends=None, tcc=None, btm=None):
         _hits = [e[0] for e in entries if len(e) > _idx and e[_idx]]
         if _hits:
             rout("# %s (%d):" % (_title, len(_hits)))
-            for c in _hits: rout("#   %s" % c)
+            for c in _hits: rout("#   %s" % comment_cmd(c))
     for _l in _persist_lines: rout(_l)
     for _l in _tcc_lines: rout(_l)
     if entries:
@@ -3684,6 +3714,9 @@ def _render_lines(entries, recovered, ends=None, tcc=None, btm=None):
         rout("# " + "=" * 76)
         rout("# ===== REPRODUCIBLE SCRIPT (in order) — copy from here to 'end of script' =====")
         rout("# " + "=" * 76)
+        # Pasted into an interactive zsh, `#` starts a comment only with this option (off by default on macOS);
+        # bash and sh read the line as a failing command, absorbed by `|| true`.
+        rout("setopt interactivecomments 2>/dev/null || true")
         # --mdm rewrites user paths into variables; the script is runnable only if it defines them first.
         if MDM:
             for _l in _mdm_script_header([e[0] for e in entries]): rout(_l)
@@ -3701,7 +3734,7 @@ def _render_lines(entries, recovered, ends=None, tcc=None, btm=None):
                 rout("sleep %s%s" % (sleep_arg(_gap),
                                      "   # observed %ds, capped" % int(_gap)
                                      if _gap > _SLEEP_MAX else ""))
-            _bits = ([("via %s" % v)] if v else []) + ([nt] if nt else [])
+            _bits = ([("via %s" % inert_word(v))] if v else []) + ([nt] if nt else [])
             rout(c + ("   # " + " — ".join(_bits) if _bits else ""))
         rout("# ===== end of script =====")
         rout("")
@@ -3709,13 +3742,13 @@ def _render_lines(entries, recovered, ends=None, tcc=None, btm=None):
         # A filter (--marks-only) can be what emptied the report: say so instead of "nothing captured".
         rout("# (nothing carried a mark)" if MARKS_ONLY else "# (nothing captured)")
     if _schema is not None and not STABLE:
-        rout("# eslogger schema_version: %s" % _schema)
+        rout("# eslogger schema_version: %s" % inert_word(_schema))
     if _degraded and not STABLE:
         rout("")
         rout("# ⚠ %d event(s) were observed but could not be fully read:"
              % sum(_degraded.values()))
         for _r in sorted(_degraded):
-            rout("#   %d x %s" % (_degraded[_r], _r))
+            rout("#   %d x %s" % (_degraded[_r], inert_word(_r)))
         rout("#   The capture is incomplete by that much. If this is a new macOS,")
         rout("#   eslogger's event shape has moved — run with --debug to see it.")
 
@@ -3797,7 +3830,7 @@ def recover_report():
         # Said out loud: silence would look like a clean previous stop.
         rep_out("# WARNING: an accumulator at %s was refused — a symlink, or not "
                 "owned by this run. Nothing was recovered from it, and it was left "
-                "untouched." % REPORT_FILE)
+                "untouched." % inert_word(REPORT_FILE))
         return
     # `or tcc or btm`: a run that saw only TCC changes or login items still has something to recover.
     if ents or tcc or btm: _render_lines(ents, True, ends, tcc, btm)
@@ -4597,10 +4630,10 @@ def emit_perm(label, cmd, destr, path, kind, via="", actor=None):
     if SOLO:
         out("C\t%s%s" % (cmd, ("   # " + " ".join(_marks)) if _marks else ""))
     else:
-        out("C\t# %s changed permissions:%s" % (label,
+        out("C\t# %s changed permissions:%s" % (inert_word(label),
             ("  " + "  ".join(_marks)) if _marks else ""))
         out("C\t%s" % cmd)
-    if via: out("C\t# via %s" % via)
+    if via: out("C\t# via %s" % inert_word(via))
     if label not in perm_noted:
         perm_noted.add(label)
         out("C\t# NOTE: changed through a system call, not by running this command — the line above reproduces it")
@@ -4629,14 +4662,14 @@ def emit_xattr(label, cmd, path, name, via="", actor=None):
     if SOLO:
         out("C\t%s%s" % (cmd, ("   # " + " ".join(_marks)) if _marks else ""))
     else:
-        out("C\t# %s removed an extended attribute:%s" % (label,
+        out("C\t# %s removed an extended attribute:%s" % (inert_word(label),
             ("  " + "  ".join(_marks)) if _marks else ""))
         out("C\t%s" % cmd)
-    if via: out("C\t# via %s" % via)
+    if via: out("C\t# via %s" % inert_word(via))
     # com.apple.quarantine is the one attribute whose removal means something specific enough to say in words:
     # Gatekeeper no longer treats this file as downloaded from the internet.
     if name == "com.apple.quarantine":
-        out("C\t# NOTE: this file's Gatekeeper quarantine was lifted — it will now open without the \"unidentified developer\" warning")
+        out("C\t# NOTE: the Gatekeeper quarantine on this file was lifted — it will now open without the \"unidentified developer\" warning")
     if label not in xattr_noted:
         xattr_noted.add(label)
         out("C\t# NOTE: removed through a system call, not by running this command — the line above reproduces it")
@@ -4702,10 +4735,10 @@ def emit_file(label, verb, path, dst="", via="", actor=None):
     if SOLO:
         out("C\t%s%s" % (cmd, ("   # " + " ".join(_marks)) if _marks else ""))
     else:
-        out("C\t# %s %s:%s" % (label, verb,
+        out("C\t# %s %s:%s" % (inert_word(label), verb,
                                ("  " + "  ".join(_marks)) if _marks else ""))
         out("C\t%s" % cmd)
-    if via: out("C\t# via %s" % via)
+    if via: out("C\t# via %s" % inert_word(via))
     if _persist:
         # Said every time, not once per app: this is the line an audit is for. It records the act; the temp
         # source is gone.
@@ -4780,9 +4813,9 @@ def emit_wipe(label, root, n, via="", whole=False, verified=False, actor=None):
     if SOLO:
         out("C\t%s%s" % (cmd, "   # ⚠ system scope" if scoped else ""))
     else:
-        out("C\t# %s deleted:%s" % (label, "  ⚠ system scope" if scoped else ""))
+        out("C\t# %s deleted:%s" % (inert_word(label), "  ⚠ system scope" if scoped else ""))
         out("C\t%s" % cmd)
-    if via: out("C\t# via %s" % via)
+    if via: out("C\t# via %s" % inert_word(via))
     if verified:
         # Verified, not inferred: nothing predating the wipe survived, so the line is an exact reproduction.
         out("C\t# NOTE: %d entries erased %s by direct system calls (no shell command) — %s"
@@ -4883,7 +4916,7 @@ def flush_deletes():
                     out("C\t# NOTE: %d syscall deletions listed individually under %s — "
                         "not folded, something there predates this run and a glob delete "
                         "would remove more than was observed"
-                        % (nm_n[d], d))
+                        % (nm_n[d], inert_word(d)))
                 _held = _EV_T
                 _EV_T = evts[(lbl, p)]
                 try: emit_file(lbl, "deleted", p, via=vias[p], actor=acts[(lbl, p)])
@@ -4969,7 +5002,7 @@ def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
                     # `CoreDuetd` reads whole.
                     t = x[p.rfind("/") + 1:].lstrip("/")
                     return t or x.rstrip("/").rsplit("/", 1)[-1]
-                _names = [_tail(x) for x in _paths]
+                _names = [inert_word(_tail(x)) for x in _paths]
                 _shown = ", ".join(_names[:4])
                 if len(_names) > 4: _shown += " +%d more" % (len(_names) - 4)
                 # `~/Library/Safari` is not a pattern: the shell resolved a home, which must not read as a glob
@@ -4978,7 +5011,7 @@ def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
                     out("C\t# NOTE: the shell expanded that pattern to %d path%s: %s"
                         % (len(_paths), "" if len(_paths) == 1 else "s", _shown))
                 else:
-                    out("C\t# NOTE: the shell resolved that path to %s" % _paths[0])
+                    out("C\t# NOTE: the shell resolved that path to %s" % inert_word(_paths[0]))
                 del pending_glob[_gkey]
                 return
         if has_glob(_ja):
@@ -5029,10 +5062,10 @@ def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
     if via_helper: _notes.append("⚠ run as root by a privileged helper — prefix with sudo")
     elif _scoped: _notes.append("⚠ writes outside what the user can write — prefix with sudo")
     if _pipes: _notes.append("⚠ reads a pipe — this line alone will not replay")
-    if _relative: _notes.append("run from %s" % cwd)
+    if _relative: _notes.append("run from %s" % inert_word(cwd))
     # literal unless the line is a shell payload: an argv's `*` is a character of a real filename (see the shq
     # note above), and _report_form's cmd_quote would lift it out of the quotes.
-    record(cmd, _destr, _net, note="; ".join(_notes), pid=pid, persist=_persist,
+    record(cmd, _destr, _net, note=" — ".join(_notes), pid=pid, persist=_persist,
            secret=_secret, literal=not _show_payload)
     mdm_header()
     if NDJSON:
@@ -5047,7 +5080,7 @@ def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
     if SOLO:
         out("C\t%s%s" % (cmd, ("   # " + " ".join(_marks)) if _marks else ""))
     else:
-        out("C\t# %s ran:%s" % (label, ("  " + "  ".join(_marks)) if _marks else ""))
+        out("C\t# %s ran:%s" % (inert_word(label), ("  " + "  ".join(_marks)) if _marks else ""))
         out("C\t%s" % cmd)
     # Reuse hint, once per helper: repeating it on every command would drown the output.
     if via_helper and label not in helper_noted:
@@ -5062,7 +5095,7 @@ def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
     if _pipes:
         out("C\t# NOTE: reads its input from a pipe — that input is not captured, so this line alone will not replay")
     if _relative:
-        out("C\t# NOTE: run from %s — the relative paths above resolve against it" % cwd)
+        out("C\t# NOTE: run from %s — the relative paths above resolve against it" % inert_word(cwd))
 
 # ============================================================================
 # --debug — the diagnostic channel
@@ -5078,7 +5111,12 @@ def debug_filtered(msg):
     if msg in _filt_seen and now - _filt_seen[msg] < 30.0: return
     if len(_filt_seen) > TRACK_CAP: _filt_seen.clear()
     _filt_seen[msg] = now
-    out("C\t# FILTERED: %s" % msg)
+    # `<command> (<reason>)`: the command through comment_cmd, the reason (it can name a tool) as a word.
+    _head, _sep, _why = msg.rpartition(" (")
+    if _sep and _why.endswith(")"):
+        out("C\t# FILTERED: %s (%s)" % (comment_cmd(_head), inert_word(_why[:-1])))
+    else:
+        out("C\t# FILTERED: %s" % comment_cmd(msg))
 
 _dbg_unattr = 0
 def debug_unattributed(tgt, args):
@@ -5091,7 +5129,7 @@ def debug_unattributed(tgt, args):
     if is_platform(tgt) and not is_interpreter(path): return
     _dbg_unattr += 1
     out("C\t# UNATTRIBUTED: %s (no tracked ancestor, and no third-party actor to name)"
-        % (" ".join(shq(a) for a in args) if args else path))
+        % comment_cmd(" ".join(shq(a) for a in args) if args else path))
 
 # The dump exists to reveal a file event's SHAPE — which field holds the source, which holds the destination
 # directory, which holds the new name.
@@ -5100,6 +5138,24 @@ def _shape_only(node, depth=0):
     if depth > 8 or not isinstance(node, dict): return node
     return dict((k, _shape_only(v, depth + 1))
                 for k, v in node.items() if k not in _DBG_DROP)
+
+# A dump is JSON on a `# DEBUG:` line. ASCII only (a lone surrogate cannot be written as UTF-8), and `$`, a
+# backquote, `!` and `'` as \u escapes: the same JSON, but pasted, its strings sit in double quotes that hold
+# nothing a shell substitutes. A capped dump is cut outside a string, so those quotes still pair.
+_DBG_ESC = {ord("$"): "\\u0024", ord("`"): "\\u0060", ord("!"): "\\u0021", ord("'"): "\\u0027"}
+def _dbg_json(obj, cap=0):
+    s = json.dumps(obj, ensure_ascii=True).translate(_DBG_ESC)
+    if not cap or len(s) <= cap: return s
+    q = esc = False
+    cut = 0
+    for i, c in enumerate(s[:cap]):
+        if esc: esc = False
+        elif c == "\\": esc = True
+        elif c == '"':
+            q = not q
+            if not q: cut = i + 1
+        elif not q: cut = i + 1
+    return s[:cut]
 
 _dbg = 0
 _dbg_file = {}        # event kind -> how many of its bodies have been dumped
@@ -5121,10 +5177,9 @@ def debug_dump(d):
             if isinstance(ev.get(_k), dict):
                 if _dbg_file.get(_k, 0) >= 2: return
                 _dbg_file[_k] = _dbg_file.get(_k, 0) + 1
-                out("D\t" + json.dumps({"file_event": _k,
-                                        "body": _shape_only(ev[_k]),
-                                        "process_exe": exe_path(_node(d, "process"))},
-                                       ensure_ascii=True)[:900])   # ASCII only: a lone surrogate cannot be written as UTF-8
+                out("D\t" + _dbg_json({"file_event": _k,
+                                       "body": _shape_only(ev[_k]),
+                                       "process_exe": exe_path(_node(d, "process"))}, 900))
                 return
         return
     ex = ev.get("exec", {}) or {}
@@ -5156,7 +5211,7 @@ def debug_dump(d):
         "args_under_exec": (ex.get("args") or [])[:3] if isinstance(ex.get("args"), list) else [],
         "args_under_target": (tgt.get("args") or [])[:3] if isinstance(tgt, dict) and isinstance(tgt.get("args"), list) else [],
     }
-    out("D\t" + json.dumps(sample, ensure_ascii=True))   # see above: never lose the event to the dump
+    out("D\t" + _dbg_json(sample))   # see above: never lose the event to the dump
 
 # ============================================================================
 # SHUTDOWN AND THE MAIN LOOP
@@ -5217,7 +5272,9 @@ while True:
             # tracking exec already built, or from the process being a known app on its own.
             if isinstance(ev.get("exit"), dict):
                 _xp = proc_pid(proc)
-                if _xp is not None: note_exit(_xp)
+                if _xp is not None:
+                    note_exit(_xp)
+                    untrack(_xp, proc_actor(proc)[1])
                 continue
             # A privacy grant/revoke: tccd's own process, never the app it is about — attributed on
             # identity/instigator, not on `proc`.
@@ -5347,6 +5404,11 @@ while True:
             if kind in _PERM_KINDS:
                 _pc = perm_change(kind, body)
                 if not _pc: continue
+                # A pseudo-terminal is session plumbing (login resets it on tab close); its number never replays.
+                # Serial devices (/dev/tty.usbserial-…) are not matched.
+                if not SHOW_NOISE and re.match(r"/dev/(ttys[0-9]+|[pt]ty[p-w][0-9a-f]|ptmx)$", _pc[2] or ""):
+                    debug_filtered("%s (tty)" % _pc[0])
+                    continue
                 if not SHOW_NOISE and not (_pc[1] or system_scope(_pc[2])
                                            or is_persistence(_pc[2])):
                     debug_filtered("%s (self-permission)" % _pc[0])
@@ -5399,6 +5461,11 @@ while True:
                 flush_deletes()
                 emit_file(flabel, "moved", src, dst, via=_fvia, actor=_fact)
             else:
+                # bash's here-document temp file (sh-thd-N / sh-thd.XXXXXX), unlinked by the shell itself: not an act of the app.
+                if (not SHOW_NOISE and re.match(r"(/private)?/(var/tmp|tmp|var/folders/[^/]+/[^/]+/T)/sh-thd[-.][A-Za-z0-9]+$", src)
+                        and re.search(r"/(bash|sh|zsh|dash|ksh)$", exe_path(proc) or "")):
+                    debug_filtered("rm %s (heredoc temp)" % src)
+                    continue
                 handle_delete(flabel, src, _fvia, _fact)
             continue
 
@@ -5430,7 +5497,7 @@ while True:
 
         seed = resolve_app(tgt, tgt_script)
         if seed is not None and tpid is not None and tpid not in tracked:
-            tracked[tpid] = seed
+            track(tpid, seed, proc_actor(tgt)[1])
 
         label = None
         inherited = False
@@ -5457,12 +5524,12 @@ while True:
             _who = seed if seed is not None else label
             if not DESTRUCTIVE_ONLY and not ONLY_CMDS_SET and _who not in seen_apps:
                 seen_apps.add(_who)
-                out("C\t# %s started (pid %s)" % (_who, tpid if tpid is not None else "?"))
+                out("C\t# %s started (pid %s)" % (inert_word(_who), tpid if tpid is not None else "?"))
             continue
 
         for pp in ((tpid,) if is_cli_launch(tgt_path, tgt_script) else (tpid, apid)):
-            if pp is not None: tracked[pp] = label
-        if len(tracked) > TRACK_CAP: tracked.clear()
+            if pp is not None:
+                track(pp, label, proc_actor(tgt if pp == tpid else proc)[1])
 
         _ep, _ea, _epl = effective(tgt_path, args)
         if ONLY_CMDS_SET:
@@ -5491,7 +5558,7 @@ while True:
         if _pk not in _parser_errors and len(_parser_errors) < 64:
             _parser_errors.add(_pk)
             _pe = "%s: %s" % (_pk, str(_exc)[:160])
-            if DEBUG: out("D\tparser error, event skipped — %s" % _pe)   # `# DEBUG: …`
+            if DEBUG: out("D\tparser error, event skipped — %s" % inert_word(_pe))   # `# DEBUG: …`
             else: sys.stderr.write("culprit: parser error, event skipped — %s\n" % _pe)
         continue
 
@@ -5537,9 +5604,8 @@ cmd_watch() {
   local _errf="$CULPRIT_TMPDIR/eslogger.err"
   # eslogger line-buffers on a pipe; the parser reads with readline() (unbuffered via -u) so sparse events are
   # not stuck in a block buffer. --format json is pinned: eslogger documents it only as "default: json".
-  PYTHONIOENCODING=utf-8:surrogateescape \
   /usr/bin/eslogger --format json "${EVENT_TYPES[@]}" 2>"$_errf" \
-    | "$PYTHON3_BIN" -u "$PARSER" "${_PARSER_ARGS[@]}" \
+    | "$PYTHON3_BIN" -I -u "$PARSER" "${_PARSER_ARGS[@]}" \
     | while IFS=$'\t' read -r _k _v; do
         [ -n "$_k" ] || continue
         case "$_k" in
@@ -5568,9 +5634,12 @@ cmd_watch() {
 if [ "$ALL_MODE" = "true" ]; then
   _apps_summary="ALL third-party apps and tools"
 else
-  # Join with zsh's (j) flag: `print` puts the array on one line, and labels with a space ("Font Finagler")
-  # would blur into their neighbours.
-  _apps_summary="${(j:, :)${TARGET_APPS[@]%%|*}}"
+  # Joined with ", ": labels with a space ("Font Finagler") would blur into their neighbours. A label can be
+  # a bundle's name, so each is rendered by _inert_word.
+  typeset -a _lbls=()
+  for _t in "${TARGET_APPS[@]}"; do _lbls+=("$(_inert_word "${_t%%|*}")"); done
+  _apps_summary="${(j:, :)_lbls}"
+  unset _lbls
 fi
 [ "$DESTRUCTIVE_ONLY" = "true" ] && _apps_summary="${_apps_summary} (destructive commands only)"
 _scope_summary="commands"
@@ -5631,8 +5700,17 @@ fi
 
 _fatal() { printf "# culprit: %s\n" "$(_inert "$1")" >&2; exit 1; }
 [ "$(/usr/bin/id -u)" = "0" ] || _fatal "must run as root (sudo) — eslogger needs it."
-[ -x /usr/bin/eslogger ] || _fatal "/usr/bin/eslogger not found — needs macOS 13+ (Ventura)."
+[ -x /usr/bin/eslogger ] || _fatal "/usr/bin/eslogger not found — Culprit needs macOS 15 or later."
 [ -n "$PYTHON3_BIN" ] || _fatal "python3 unavailable — run 'xcode-select --install' (or install via Homebrew)."
+# Warns on macOS older than 15 (tested on 15 and later); never exits, never changes the status.
+_os_support_note() {
+  local v="$1" major="${1%%.*}"
+  [[ "$major" == <-> ]] || return 0
+  (( major < 15 )) || return 0
+  printf "# culprit: WARNING: macOS %s is not supported — Culprit is tested on macOS 15 and later; a capture may be incomplete.\n" "$(_inert "$v")" >&2
+  return 0
+}
+_os_support_note "$(/usr/bin/sw_vers -productVersion 2>/dev/null)"
 
 # --detach: hand the prompt back and keep watching. Done HERE, after the prerequisites, so a missing sudo or
 # python3 is still reported to the face of the person typing.
@@ -5662,9 +5740,10 @@ if [ "$DETACH" = "true" ] && [ -z "${CULPRIT_DETACHED:-}" ]; then
   export CULPRIT_DETACH_READY="$CULPRIT_TMPDIR/detach.ready"
   # Through `/bin/zsh -f`, not the file itself: exec'ing the script would need it executable, and its shebang
   # reads zsh's startup files (a `.zshenv` under $ZDOTDIR or $HOME, run as root). -f reads none of them.
-  /usr/bin/nohup "$PYTHON3_BIN" -c \
-    'import os,sys; os.setsid(); os.execv("/bin/zsh", ["/bin/zsh", "-f"] + sys.argv[1:])' \
-    "${0:A}" "$@" >/dev/null 2>"$_detach_err" &
+  # The child re-reads the same argv, so it starts in the caller's directory, where relative paths resolve.
+  /usr/bin/nohup "$PYTHON3_BIN" -I -c \
+    'import os,sys; os.chdir(sys.argv[1]); os.setsid(); os.execv("/bin/zsh", ["/bin/zsh", "-f"] + sys.argv[2:])' \
+    "$_CULPRIT_CWD" "$_CULPRIT_SELF" "$@" >/dev/null 2>"$_detach_err" &
   _detached_pid=$!
   _dw=0
   while [ ! -f "$CULPRIT_DETACH_READY" ] && [ "$_dw" -lt 100 ]; do

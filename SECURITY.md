@@ -18,7 +18,7 @@ older version.
 
 Report privately — not in a public issue:
 
-- **Email**: gbonpain@capside.fr, or
+- **Email**: <gbonpain@capside.fr>, or
 - **GitHub**: private vulnerability reporting, from this repository's Security tab.
 
 Include, where you can:

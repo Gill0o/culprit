@@ -13,7 +13,7 @@ baseline, no alerting.
 It observes only: it never runs, blocks or modifies anything on the Mac it watches. It writes its
 own log file, plus a copy of every emitted line to the unified log ([Security](#security)).
 
-**Requires** root, macOS 13+, `python3`, and Full Disk Access for the terminal that launches it
+**Requires** root, macOS 15+, `python3`, and Full Disk Access for the terminal that launches it
 (System Settings → Privacy & Security → Full Disk Access).
 
 ## Install
@@ -45,7 +45,7 @@ Stop a capture with Ctrl-C.
 
 A real `--report` run on Zoom, launched and quit (macOS 27, user renamed `alice`, lists cut at `…`):
 
-```
+```text
 # ===== Culprit report — 186 distinct commands =====
 # ⚠ destructive (125):
 #   /bin/launchctl bootout gui/501/us.zoom.updater.gui.501.app.terminate.update
@@ -105,7 +105,7 @@ parameter.
 
 Shell-outs (`exec`, always) plus native-syscall file operations — deletions, moves, copies (APFS
 clones), links, permission changes and extended-attribute removals — each printed as the command
-that reproduces it. Privacy (TCC) grants/revokes (macOS 26+) and login-item adds/removes
+that reproduces it. Privacy (TCC) grants/revokes (macOS 15.4+) and login-item adds/removes
 (Background Task Management) are reported as information, since no command can replay them.
 Marks: `⚠ destructive`, `⚠ network`, `⚠ persistence`, `⚠ secret`, `⚠ system scope`. Treat
 destructive output as a reviewed draft, not a blind replay.
@@ -132,6 +132,11 @@ A clean capture does not mean an app is inert. It means the app did nothing Culp
 - **Put the log where the target does not sweep** — a cleaner app will delete it mid-run.
 
 Report a vulnerability: [SECURITY.md](SECURITY.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Pull requests are applied to the development tree and ship in
+the next release, credited to their author. For a security issue, see [SECURITY.md](SECURITY.md).
 
 ## License
 
