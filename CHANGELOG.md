@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.4 — 2026-11-14
+
+### Security
+- **A shell payload prints bare only when it is plain words**, else quoted whole (`sh -c '…'`, or `$'…'` if it holds a quote): pasted, it cannot spill into the next line.
+- **The report keeps an app's literal `$loggedInUser` or `~/` inert**; only what `--mdm` wrote expands. `rm -rf '/x/$loggedInUser'` no longer replays as `rm -rf /x/`.
+- **No note trails a command, in any mode**: marks sit on their own `#` line above it. `--mdm` quotes `!`; its header and the TCC lines (`→`, not `->`) are inert prose.
+
+### Fix
+- A pipeline printed whole no longer carries a false "reads a pipe — will not replay" note: the pipe is in the line.
+- **A copied LaunchDaemons tree is not persistence**: only `/Library/…`, `~/Library/…` and root's `Library` count. A package that `pkgutil` expanded under `/var/folders` was reported as persistence.
+
 ## 1.0.3 — 2026-11-13
 
 ### Compatibility

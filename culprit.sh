@@ -1,7 +1,7 @@
 #!/bin/zsh -f
 # ============================================================================
 # Script: culprit.sh
-# Version: 1.0.3
+# Version: 1.0.4
 # Author: Gilles Bonpain
 # Powered by Claude AI
 # Description: Attribute what macOS apps and tools run, delete and read
@@ -1386,14 +1386,17 @@ _MDM_VAR_RE = re.compile(r'\$(?:loggedInUser|userDir|userCache|userTemp)')
 # Everything double quotes would still interpret is escaped on promotion, so a path holding
 # backticks or `$` cannot become a command substitution in a root fleet script.
 _MDM_DQ_ESC = re.compile(r'([\\"`$])')
+# `!` is the one more: a backslash before it is NOT removed inside bash double quotes, so it is closed out and
+# single-quoted (`"a"'!'"b"`), which history expansion leaves alone in both shells.
+def _mdm_esc(t): return _MDM_DQ_ESC.sub(r'\\\1', t).replace("!", "\"'!'\"")
 def _mdm_dq(seg):
     # Escape the segment, then restore the --mdm variables untouched.
     out, last = [], 0
     for m in _MDM_VAR_RE.finditer(seg):
-        out.append(_MDM_DQ_ESC.sub(r'\\\1', seg[last:m.start()]))
+        out.append(_mdm_esc(seg[last:m.start()]))
         out.append(m.group(0))
         last = m.end()
-    out.append(_MDM_DQ_ESC.sub(r'\\\1', seg[last:]))
+    out.append(_mdm_esc(seg[last:]))
     return '"%s"' % "".join(out)
 
 # An ANSI-C `$'…'` argument is matched whole, first; a --mdm variable is spliced out between two
@@ -1443,8 +1446,20 @@ def _mdm_ansi_paths(seg):
     if HOME: seg = re.sub(re.escape(HOME) + _MDM_ANSI_B, "/Users/$loggedInUser", seg)
     return _MDM_FOLDERS_ANSI_RE.sub(lambda m: _MDM_VAR[m.group(1)], seg)
 
+# A `$loggedInUser`-like word that ARRIVED in the text is the app's own bytes, never ours: it is parked behind
+# private-use marks while the rewrite runs (mdm_quotes would lift it into double quotes, where it expands), then
+# put back inert: plain in single quotes, `\$` in double quotes.
+_MDM_LIT_RE = re.compile(r'\$(loggedInUser|userDir|userCache|userTemp)')
+_MDM_LIT_BACK_RE = re.compile('\ue000(loggedInUser|userDir|userCache|userTemp)\ue001')
+_MDM_LIT_WALK_RE = re.compile(r"""\$'(?:[^'\\]|\\.)*'|'[^']*'|"(?:[^"\\]|\\.)*\"""", re.S)
+def _mdm_lit_back(s):
+    s = _MDM_LIT_WALK_RE.sub(lambda m: _MDM_LIT_BACK_RE.sub(
+        (r'\\$\1' if m.group(0)[0] == '"' else r'$\1'), m.group(0)), s)
+    return _MDM_LIT_BACK_RE.sub(r'$\1', s)
+
 def mdm_rewrite(s):
     if not MDM: return s
+    s = _MDM_LIT_RE.sub('\ue000\\1\ue001', s)
     # The bare home still counts (bounded, so /Users/ardvark is left alone). Inside `$'…'` the
     # boundary can also be an escape such as `\n`.
     s = _MDM_ANSI_SEG_RE.sub(lambda m: _mdm_ansi_paths(m.group(0)), s)
@@ -1455,15 +1470,23 @@ def mdm_rewrite(s):
     for _rx in _MDM_USER_RES: s = _rx.sub(r'\1$loggedInUser', s)
     # A single-quoted path now holding a variable is switched to double quotes.
     s = mdm_quotes(s)
-    return s
+    return _mdm_lit_back(s) if "\ue000" in s else s
 
 # The resolver lines --mdm output depends on, kept as data so --report emits the same block (_render_lines).
 _MDM_HEADER = (
     "# NOTE: --mdm — define these once at the top of your script, then every command below deploys on any Mac:",
-    "#   loggedInUser=$(/usr/bin/stat -f%Su /dev/console)",
-    "#   userDir=$(/usr/bin/sudo -u \"$loggedInUser\" /usr/bin/getconf DARWIN_USER_DIR)",
-    "#   userCache=$(/usr/bin/sudo -u \"$loggedInUser\" /usr/bin/getconf DARWIN_USER_CACHE_DIR)",
-    "#   userTemp=$(/usr/bin/sudo -u \"$loggedInUser\" /usr/bin/getconf DARWIN_USER_TEMP_DIR)",
+    "#   loggedInUser = output of /usr/bin/stat -f%Su /dev/console",
+    "#   userDir = output of /usr/bin/getconf DARWIN_USER_DIR, run as loggedInUser through /usr/bin/sudo -u",
+    "#   userCache = output of /usr/bin/getconf DARWIN_USER_CACHE_DIR, run the same way",
+    "#   userTemp = output of /usr/bin/getconf DARWIN_USER_TEMP_DIR, run the same way",
+)
+# The same four as live code (the printed header is comment text only: a `$(` in a `#` line would run if pasted
+# into a zsh without interactivecomments).
+_MDM_RESOLVERS = (
+    "loggedInUser=$(/usr/bin/stat -f%Su /dev/console)",
+    "userDir=$(/usr/bin/sudo -u \"$loggedInUser\" /usr/bin/getconf DARWIN_USER_DIR)",
+    "userCache=$(/usr/bin/sudo -u \"$loggedInUser\" /usr/bin/getconf DARWIN_USER_CACHE_DIR)",
+    "userTemp=$(/usr/bin/sudo -u \"$loggedInUser\" /usr/bin/getconf DARWIN_USER_TEMP_DIR)",
 )
 
 # The same resolvers as live code, for the report's script. With nobody at the console the script says so and exits 0.
@@ -1472,11 +1495,11 @@ def _mdm_script_header(cmds):
     _vars = [v for v in ("userDir", "userCache", "userTemp") if "$" + v in _body]
     if not _vars and "$loggedInUser" not in _body: return []
     _hdr = ["# --mdm: resolved on the Mac that runs this script",
-            _MDM_HEADER[1][4:],
+            _MDM_RESOLVERS[0],
             'case "$loggedInUser" in ""|root|loginwindow|_mbsetupuser) '
             'echo "no user logged in — nothing to do"; exit 0;; esac']
-    for _l in _MDM_HEADER[2:]:
-        if _l[4:].split("=", 1)[0] in _vars: _hdr.append(_l[4:])
+    for _l in _MDM_RESOLVERS[1:]:
+        if _l.split("=", 1)[0] in _vars: _hdr.append(_l)
     return _hdr
 
 def mdm_header():
@@ -2190,10 +2213,9 @@ def atomic_write(src, dst):
 _PERSIST_ROOTS = ("/usr/local/bin/", "/usr/local/sbin/",
                   "/Library/StartupItems/", "/Library/Extensions/",
                   "/Library/SystemExtensions/")
-# Matched anywhere in the path, not as a prefix: LaunchAgents exist per-user
-# under ~/Library as well as system-wide.
-_PERSIST_ANY = ("/Library/LaunchDaemons/", "/Library/LaunchAgents/",
-                "/Library/PrivilegedHelperTools/")
+# Anchored at /Library, a user's or root's ~/Library: LaunchAgents exist per-user as well as system-wide,
+# but a package expanded under a temp dir (…/Payload/System/Library/LaunchDaemons/) is not an install.
+_PERSIST_ANY_RE = re.compile(r"(?:/Users/[^/]+|/var/root|~)?/Library/(?:LaunchDaemons|LaunchAgents|PrivilegedHelperTools)/")
 # Only the /etc paths that re-run on their own (periodic scripts, login/rc shells, sudoers, pam.d,
 # sshd, cron, paths.d, emond). A plain .conf or .plist an app owns stays plumbing: all of /etc would
 # mark ordinary atomic rewrites as persistence and defeat the atomic-write noise rule.
@@ -2212,7 +2234,7 @@ def is_etc_persistence(path):
     return p.startswith(_PERSIST_ETC_DIRS)
 def is_persistence(path):
     if not path: return False
-    return (path.startswith(_PERSIST_ROOTS) or any(d in path for d in _PERSIST_ANY)
+    return (path.startswith(_PERSIST_ROOTS) or _PERSIST_ANY_RE.match(_canon(path)) is not None
             or is_etc_persistence(path))
 
 def rename_dest(body):
@@ -3174,6 +3196,11 @@ def _has_bare_operator(cmd):
         elif q == '"':
             if c == "\\": i += 1
             elif c == '"': q = None
+        elif c == "$" and cmd[i + 1:i + 2] == "'":      # ANSI-C: a backslash escapes the next character
+            i += 2
+            while i < n and cmd[i] != "'":
+                i += 2 if cmd[i] == "\\" else 1
+            if i >= n: return True
         elif c in "'\"": q = c
         elif c == "\\": i += 1
         elif c in _SHELL_OPS: return True
@@ -3194,7 +3221,11 @@ _BADBYTE_RE = re.compile(r'[\udc80-\udcff]')
 _SHQ_RE = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]')
 _LONE_RE = re.compile(r'[\ud800-\udfff]')
 _ANSI_C_ESC = {"\n": "\\n", "\t": "\\t", "\r": "\\r", "\\": "\\\\", "'": "\\x27"}
-def shq(s):
+def shq(s, readable=False):
+    # readable: a script word holding `'` (and no control character) is written `$'…'` with `\'`, where shlex.quote
+    # would splice `'"'"'` into every quote. Only the `sh -c` payload word: the one that is read by eye.
+    if readable and "'" in s and not _SHQ_RE.search(s):
+        return "$'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
     if not _SHQ_RE.search(s): return shlex.quote(s)
     out = []
     for ch in s:
@@ -3284,6 +3315,38 @@ def _code_operands(toks):
             if i > 0 and k + i + 1 < len(toks): out.add(k + i + 1)
     return out
 
+# What the report's re-reading must tell apart: a bare `~/` (the shell's home: expanded, so `~/Library` and the
+# absolute line collapse) from a quoted one (an argv word naming a directory called `~`: kept), and a live
+# --mdm variable (bare or in double quotes) from a `$name` the app wrote (quoted, or `\$name`). The live ones are
+# parked behind private-use marks across shlex, and _rf_live raises them back.
+_RF_WALK_RE = re.compile(r"""('[^']*')|("(?:[^"\\]|\\.)*")|(\$'(?:[^'\\]|\\.)*')|(\\.)"""
+                         r"""|\$(loggedInUser|userDir|userCache|userTemp)|(.)""", re.S)
+_RF_DQ_RE = re.compile(r'(\\\\)|\\([$`])|\$(loggedInUser|userDir|userCache|userTemp)')
+_RF_MARK_RE = re.compile('\ue000(loggedInUser|userDir|userCache|userTemp)\ue001')
+def _rf_prep(cmd):
+    out, prev = [], " "
+    for m in _RF_WALK_RE.finditer(cmd):
+        t = m.group(0)
+        if m.group(2) is not None and MDM:
+            t = '"' + _RF_DQ_RE.sub(lambda d: d.group(1) or d.group(2) or "\ue000" + d.group(3) + "\ue001",
+                                    t[1:-1]) + '"'
+        elif m.group(5) is not None and MDM:
+            t = "\ue000" + m.group(5) + "\ue001"
+        elif m.group(6) == "~" and HOME and prev in " \t\n" and cmd[m.end():m.end() + 1] == "/":
+            t = shq(HOME)
+        out.append(t); prev = t[-1:]
+    return "".join(out)
+def _rf_live(s):
+    def _seg(m):
+        if m.group(1) is not None:
+            if "\ue000" not in m.group(1): return m.group(0)
+            return "".join("\"$%s\"" % x if i % 2 else ("$'%s'" % x if x else "")
+                           for i, x in enumerate(_RF_MARK_RE.split(m.group(1))))
+        if "\ue000" not in m.group(2): return m.group(0)
+        return '"' + "".join("$" + x if i % 2 else _MDM_DQ_ESC.sub(r'\\\1', x)
+                              for i, x in enumerate(_RF_MARK_RE.split(m.group(2)))) + '"'
+    return _RF_MARK_RE.sub(r'$\1', _SQ_OR_ANSI_RE.sub(_seg, s))
+
 def _report_form(cmd, literal=False):
     # Canonical form for the report: the same wipe written once as an `sh -c` payload with `~` and embedded
     # quotes and once as an expanded rm collapses to one line. Expand `~` and normalise quoting. Left
@@ -3291,9 +3354,8 @@ def _report_form(cmd, literal=False):
     # line opening with `#` (a RECORD, not a command).
     if cmd.startswith("#"): return cmd
     if _has_bare_operator(cmd): return cmd
-    try: toks = shsplit(cmd)
+    try: toks = shsplit(_rf_prep(cmd))
     except Exception: return cmd
-    if HOME: toks = [HOME + t[1:] if t.startswith("~/") else t for t in toks]
     # `shlex.quote` for a path from a file EVENT: it is literal, and a file named `report-2024*.log` must
     # keep its quotes, or the pasted line deletes every match as root. `cmd_quote` stays for command
     # lines, where the glob is the app's. Never for the operand of a shell's `-c` nor a word holding a
@@ -3301,9 +3363,10 @@ def _report_form(cmd, literal=False):
     # ending in a newline could become the script the report runs.
     _whole = _code_operands(toks)
     s = " ".join((shq if (literal or k in _whole or _CTL_ANY_RE.search(t))
-                  else cmd_quote)(t) for k, t in enumerate(toks))
-    # keep $loggedInUser / $userCache expandable
-    return mdm_quotes(s)
+                  else cmd_quote)(t, *((True,) if k in _whole else ())) for k, t in enumerate(toks))
+    # Only the variables --mdm itself wrote (parked behind marks by _rf_prep) become live again; a `$` that came
+    # from the app stays inside single quotes.
+    return _rf_live(s) if "\ue000" in s else s
 
 # The accumulator is tab-separated and newline-terminated, so tabs and newlines inside a field are
 # escaped (a multi-line `osascript -e` or a literal tab would otherwise split the record).
@@ -3570,8 +3633,16 @@ def _persist_placements(cmd):
             if _hit: _fallback.append((_hit, _b))
     return _out or _fallback[-1:]
 
+def _unwrap_sh_c(cmd):
+    # A shell payload is printed as the quoted call (`sh -c 'rm -f …'`); the verb that decides is the payload's.
+    try: _t = [x for x in shsplit(cmd) if x != "sudo"]
+    except ValueError: return cmd
+    if len(_t) == 3 and _t[0].rsplit("/", 1)[-1] in ("sh", "bash", "zsh") and _t[1] == "-c": return _t[2]
+    return cmd
+
 def _persist_cmd_removed(cmd):
     # A path this run installed can also leave: the same final-state rule record_btm applies to a login item.
+    cmd = _unwrap_sh_c(cmd)
     try:
         _toks = _peel_asuser([t for t in shsplit(cmd) if t != "sudo"])
     except ValueError:
@@ -3583,6 +3654,7 @@ def _persist_cmd_removed(cmd):
 def _persist_is_activation(cmd):
     # The leading verb decides, `sudo` aside. A line that also copies (`cp … && launchctl load …`) leads with
     # the copy and keeps its rollup item.
+    cmd = _unwrap_sh_c(cmd)
     try:
         _toks = _peel_asuser([t for t in shsplit(cmd) if t != "sudo"])
     except ValueError:
@@ -3656,11 +3728,11 @@ def _tcc_lines_for(tcc):
         _short = inert_word(_short)
         if STABLE:
             # reason and update_type say how a grant arrived, not what the current state is.
-            _lines.append("#   %s: %s -> %s%s"
+            _lines.append("#   %s: %s → %s%s"
                            % (_svc, _id, _right, _app_suffix(_tlbl)))
         else:
             _via = " — via %s" % _short if _short else ""
-            _lines.append("#   %s: %s -> %s (%s, %s)%s%s"
+            _lines.append("#   %s: %s → %s (%s, %s)%s%s"
                            % (_svc, _id, _right, _reason, _utype, _via, _app_suffix(_tlbl)))
     return _lines
 
@@ -3720,7 +3792,7 @@ def _render_lines(entries, recovered, ends=None, tcc=None, btm=None):
         # --mdm rewrites user paths into variables; the script is runnable only if it defines them first.
         if MDM:
             for _l in _mdm_script_header([e[0] for e in entries]): rout(_l)
-        # Trailing comments carry what the live stream prints under a line: the actor when it is a tool the app
+        # Comments, each on a line ABOVE its command, carry what the live stream prints under a line: the actor when it is a tool the app
         # ran (`via lsregister`), and the notes that decide whether the line can be replayed.
         _gp = _gaps(entries, ends or {})
         if any(g >= _SLEEP_MIN for g in _gp):
@@ -3731,11 +3803,12 @@ def _render_lines(entries, recovered, ends=None, tcc=None, btm=None):
         for _e, _gap in zip(entries, _gp):
             c, v, nt = _e[0], _e[3], (_e[4] if len(_e) > 4 else "")
             if _gap >= _SLEEP_MIN:
-                rout("sleep %s%s" % (sleep_arg(_gap),
-                                     "   # observed %ds, capped" % int(_gap)
-                                     if _gap > _SLEEP_MAX else ""))
+                # Own line above, like the live stream: a `#` after a command shares its line with it.
+                if _gap > _SLEEP_MAX: rout("# observed %ds, capped" % int(_gap))
+                rout("sleep %s" % sleep_arg(_gap))
             _bits = ([("via %s" % inert_word(v))] if v else []) + ([nt] if nt else [])
-            rout(c + ("   # " + " — ".join(_bits) if _bits else ""))
+            if _bits: rout("# " + " — ".join(_bits))
+            rout(c)
         rout("# ===== end of script =====")
         rout("")
     elif not tcc and not btm:
@@ -4376,6 +4449,26 @@ def shell_payload(path, args):
     if i < 0: return ""
     return args[i + 1] if i + 1 < len(args) else ""
 
+# `sh -c 'rm -rf "$1"/Library' sh /Users/x`: the words after the payload are its $0, $1…. Printed alone, the
+# payload replays as `rm -rf /Library`; whenever it reads a positional parameter, the whole call is the command.
+_POSITIONAL_RE = re.compile(r'\$(?:[0-9@*#]|\{[#!]?[0-9@*#])')
+def shell_positional(path, args, payload):
+    if not payload or not _POSITIONAL_RE.search(payload): return False
+    i = shell_c_index(args)
+    return i >= 0 and i + 2 < len(args)
+
+# The payload with its positional words put back, so the exec it becomes folds into the call printed whole: `rm -rf
+# "$@"` with `sh /a /b` execs `rm -rf /a /b`, two words where the payload holds one.
+_POS_SUB_RE = re.compile(r'"\$[@*]"|"\$\{[@*]\}"|\$[@*]|\$\{[@*]\}|"\$(\d)"|"\$\{(\d+)\}"|\$(\d)|\$\{(\d+)\}')
+def positional_text(args, payload):
+    pos = args[shell_c_index(args) + 2:]
+    def _sub(m):
+        n = next((g for g in m.groups() if g is not None), None)
+        if n is None: return " ".join(shlex.quote(w) for w in pos[1:])
+        n = int(n)
+        return shlex.quote(pos[n]) if n < len(pos) else "''"
+    return _POS_SUB_RE.sub(_sub, payload)
+
 # ============================================================================
 # PAIR FOLDING — one act that reaches us as two execs
 # ============================================================================
@@ -4628,7 +4721,8 @@ def emit_perm(label, cmd, destr, path, kind, via="", actor=None):
         json_out(kind, label, cmd, via, _marks, actor=actor)
         return
     if SOLO:
-        out("C\t%s%s" % (cmd, ("   # " + " ".join(_marks)) if _marks else ""))
+        if _marks: out("C\t# " + " ".join(_marks))   # above the command, never after it
+        out("C\t%s" % cmd)
     else:
         out("C\t# %s changed permissions:%s" % (inert_word(label),
             ("  " + "  ".join(_marks)) if _marks else ""))
@@ -4660,7 +4754,8 @@ def emit_xattr(label, cmd, path, name, via="", actor=None):
         json_out("deleteextattr", label, cmd, via, _marks, actor=actor)
         return
     if SOLO:
-        out("C\t%s%s" % (cmd, ("   # " + " ".join(_marks)) if _marks else ""))
+        if _marks: out("C\t# " + " ".join(_marks))   # above the command, never after it
+        out("C\t%s" % cmd)
     else:
         out("C\t# %s removed an extended attribute:%s" % (inert_word(label),
             ("  " + "  ".join(_marks)) if _marks else ""))
@@ -4733,7 +4828,8 @@ def emit_file(label, verb, path, dst="", via="", actor=None):
         json_out(_VERB_KIND.get(verb, "unlink"), label, cmd, via, _jmarks, actor=actor)
         return
     if SOLO:
-        out("C\t%s%s" % (cmd, ("   # " + " ".join(_marks)) if _marks else ""))
+        if _marks: out("C\t# " + " ".join(_marks))   # above the command, never after it
+        out("C\t%s" % cmd)
     else:
         out("C\t# %s %s:%s" % (inert_word(label), verb,
                                ("  " + "  ".join(_marks)) if _marks else ""))
@@ -4811,7 +4907,8 @@ def emit_wipe(label, root, n, via="", whole=False, verified=False, actor=None):
                  folded=n, actor=actor, extra={"verified": bool(verified)})
         return
     if SOLO:
-        out("C\t%s%s" % (cmd, "   # ⚠ system scope" if scoped else ""))
+        if scoped: out("C\t# ⚠ system scope")
+        out("C\t%s" % cmd)
     else:
         out("C\t# %s deleted:%s" % (inert_word(label), "  ⚠ system scope" if scoped else ""))
         out("C\t%s" % cmd)
@@ -4931,6 +5028,19 @@ def handle_delete(label, path, via="", actor=None):
     if not SHOW_NOISE and covered_by_wipe(label, path, time.time()): return
     del_buf.append((label, path, via, time.time(), actor, _EV_T))
 
+def payload_reads_stdin(toks):
+    # A stage that follows `|` in the printed payload is fed by that pipe, which the line carries: only the
+    # first stage of each pipeline can be reading input from outside.
+    first = True
+    stage = []
+    for t in list(toks) + [None]:
+        if t is None or (isinstance(t, _Op) and t in _SEP_OPS):
+            if stage and first and reads_stdin(stage[0].rsplit("/", 1)[-1], stage): return True
+            stage = []
+            first = not (isinstance(t, _Op) and t in ("|", "|&"))
+        else: stage.append(t)
+    return False
+
 def reads_stdin(binary, args):
     # `xargs kill -9` is valid shell and completely unusable on its own: the PIDs came down a pipe that no exec
     # event records. A bare "-" argument is the same admission (`plutil -extract … -o - -`).
@@ -4947,16 +5057,32 @@ def has_relative_path(args):
         if "/" in a: return True
     return False
 
+# A plain word: shlex's safe set, plus a leading `~` (home) and glob characters. Neither can run anything, and a
+# bare `~/` is what lets the report write the user's home instead of the replaying shell's (root's under sudo).
+_PLAIN_TOK_RE = re.compile(r'(?:~(?=/|\Z))?[\w@%+=:,./*?\[\]-]*\Z', re.ASCII)
+def plain_payload(payload):
+    try: toks = shlex.split(payload)
+    except ValueError: return False
+    return bool(toks) and all(t and _PLAIN_TOK_RE.match(t) for t in toks)
+
 def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
     eff_path, eff_args, payload = effective(path, args)
     _jp, _ja = judged(eff_path, eff_args)
     # shlex.quote, not cmd_quote, for argv: these tokens reached execve after shell expansion, so a `*` is literal.
-    _show_payload = payload and not _CTL_ANY_RE.search(payload)
-    cmd = payload if _show_payload else (" ".join(shq(a) for a in args) if args else path)
+    # A payload prints bare only when it is one simple command of plain words that round-trips through the shell
+    # unchanged; anything else (an open quote, `;`, `$(`, a heredoc, a trailing `\`) is printed as the quoted call.
+    _show_payload = (payload and not _CTL_ANY_RE.search(payload)
+                     and not shell_positional(path, args, payload)
+                     and plain_payload(payload))
+    _pw = shell_c_index(args) + 1 if payload else -1
+    cmd = payload if _show_payload else (" ".join(shq(a, k == _pw) for k, a in enumerate(args)) if args else path)
     cmd = mdm_rewrite(cmd)
     # Dedup on a normalised form, so one logical command counts once: `sh -c 'tmutil stopbackup'` and the
-    # `tmutil stopbackup` it becomes; /usr/bin/git (a shim) and the Xcode git it re-execs.
-    if payload:
+    # `tmutil stopbackup` it becomes; /usr/bin/git (a shim) and the Xcode git it re-execs. A payload reading $1 is
+    # keyed on its whole call: `find … -exec sh -c 'rm -rf "$1"' sh {} \;` is one act per file.
+    if payload and shell_positional(path, args, payload):
+        key = label + "\x00" + "\x00".join(args)
+    elif payload:
         key = label + "\x00" + payload
     elif args:
         key = label + "\x00" + dedup_name(args[0]) + " " + " ".join(args[1:])
@@ -5022,6 +5148,8 @@ def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
             if len(pending_glob) > 500: pending_glob.clear()
         if payload:
             _remember_payload(label, payload, now)
+            if shell_positional(path, args, payload):
+                _remember_payload(label, positional_text(args, payload), now)
         elif args:
             for _p, _pt in reversed(pending_shell.get(label, ())):
                 if now - _pt >= _PENDING_SHELL_S: continue
@@ -5056,7 +5184,7 @@ def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
     if NO_QUERIES and not _marks and is_query(payload or cmd, eff_args, bool(payload)):
         debug_filtered("%s (query)" % cmd)
         return
-    _pipes = reads_stdin(eff_path.rsplit("/", 1)[-1], eff_args)
+    _pipes = (payload_reads_stdin(eff_args) if payload else reads_stdin(eff_path.rsplit("/", 1)[-1], eff_args))
     _relative = bool(cwd) and has_relative_path(_ja)
     _notes = []
     if via_helper: _notes.append("⚠ run as root by a privileged helper — prefix with sudo")
@@ -5078,7 +5206,8 @@ def emit(label, path, args, via_helper=False, cwd="", pid=None, pidver=None):
         json_out("exec", label, cmd, None, _marks, actor=(pid, pidver), extra=_x)
         return
     if SOLO:
-        out("C\t%s%s" % (cmd, ("   # " + " ".join(_marks)) if _marks else ""))
+        if _marks: out("C\t# " + " ".join(_marks))   # above the command, never after it
+        out("C\t%s" % cmd)
     else:
         out("C\t# %s ran:%s" % (inert_word(label), ("  " + "  ".join(_marks)) if _marks else ""))
         out("C\t%s" % cmd)

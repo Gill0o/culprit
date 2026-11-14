@@ -58,13 +58,14 @@ A real `--report` run on Zoom, launched and quit (macOS 27, user renamed `alice`
 …
 /bin/launchctl list
 rm -rf '/Users/alice/Library/Group Containers/BJ4HAAB9B3.ZoomClient3rd/s.zoomclient'
-rm -rf /Users/alice/Library/Caches/us.zoom.xos/WebKit/ServiceWorkers   # via com.apple.WebKit.Networking
+# via com.apple.WebKit.Networking
+rm -rf /Users/alice/Library/Caches/us.zoom.xos/WebKit/ServiceWorkers
 …
 # ===== end of script =====
 ```
 
 Each line is a command you can paste into a shell. Deletions the app made through system calls are
-written as the `rm` that reproduces them, and `# via` names the process that did the work.
+written as the `rm` that reproduces them, and a `# via` line above one names the process that did the work.
 
 ## Options
 
@@ -125,6 +126,10 @@ A clean capture does not mean an app is inert. It means the app did nothing Culp
 ## Security
 
 - Command lines may reveal user data. **Review a capture before sharing it.**
+- **Pasting is contained**: every word from the app is quoted, notes sit on their own `#` line, and a
+  shell payload that is not plain words prints as the whole quoted call (`sh -c '…'`, or `$'…'` when it
+  holds a quote), so nothing breaks out of its line. It still replays what the app did: read the
+  destructive lines first.
 - **Every line also goes to the unified log** (`logger -t culprit`), system-wide and swept up by
   `sysdiagnose`. `--log` does not move that copy, and there is no flag to suppress it.
 - **Commands typed in a third-party terminal** (iTerm2, Warp, VS Code) are captured, tokens and

@@ -11,8 +11,8 @@ older version.
 
 | Version | Supported |
 |---|---|
-| 1.0.2 (latest) | yes |
-| < 1.0.2 | no |
+| Latest release | yes |
+| Any older version | no |
 
 ## Reporting a vulnerability
 
