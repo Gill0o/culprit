@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.0.5 — 2026-11-18
+
+### Change
+- **The report's command list is for review, not for pasting whole**: header `COMMANDS IN ORDER: review, keep only what to replay; never run it whole`, footer `end of commands`.
+- **No built-in app labels**: `[app]` takes a bundle path or ID, an app in `/Applications` or a CLI tool, else `nothing matches "<name>"`. `--apps` takes several, comma-separated.
+- **Renames that matter are shown**: a same-folder rename is hidden as a save, except onto a file the user cannot write or between two real names (`x` → `x.locked`).
+- **Saves through a temp name (Firefox, Cocoa) stay hidden.**
+- **`--destructive-only` keeps persistence acts and login items.**
+- **Newly marked ⚠**: `: > f`, `perl`/`python` removals, `osascript` running an rm, `rsync --delete`, `LoginHook`, `crontab`, `tee` into a launch item, shell startup files, `/opt/homebrew/bin`.
+- **Exit codes**: 2 when the capture stops by itself (eslogger killed or refused), 141 when stdout's reader leaves (`| head`).
+
+### Fix
+- **Ctrl-C no longer cuts a big `--report`**: the stop waits for the last report line (up to 120 s; a second Ctrl-C cuts it and keeps what was recorded).
+- **`chown` with an unchanged uid or gid replays right**: `chgrp 80`, not `chown 4294967295:80`.
+- **Deletions in a folder that is not emptied** print as one narrower glob (`rm -f <dir>/[0-9]*`) when it spares every file left, else as the exact list.
+- **Replay fidelity**: a lone deleted file is `rm -f`, not `rm -rf`; `argv[0]` no longer hides the executable; repeats keep their order (`rm x`, `touch x`, `rm x`).
+- **The `run from` note also covers a bare relative name** (`rm foo`).
+- **Attribution**: a printed `rm` hides only its own deletions; an `sh -c` script with loops, `shift`, functions or zsh `$argv` prints the commands that really ran.
+- **`--mdm` rewrites only the console user's `/var/folders`**; root's or another user's stays literal.
+- **Stopping**: no orphan eslogger after `| head`; Ctrl-C during `--detach`'s start stops the child; a second signal keeps the exit code; a stuck eslogger is killed.
+- **`--detach` and the pidfile**: inherited descriptors are closed, a reused pid counts as stale, and of two captures started together on one log only one runs.
+- **Scale**: a 100k-file wipe folds in about 2 s (it was quadratic); huge argvs no longer grow the parser to gigabytes; a report line over 32 KiB is a `# NOTE`, and the report stops at 128 MiB.
+
+### Security
+- **Bidi and zero-width characters are escaped** (`\xHH`): a name holding U+202E no longer displays as another one.
+- **The log is opened once without following a link**; the report's working file and `--report-file` are refused through a link or in a folder others can write (unless sticky).
+
 ## 1.0.4 — 2026-11-14
 
 ### Security
